@@ -1,4 +1,5 @@
 import socket
+import time
 import threading
 import webbrowser
 from typing import Any, Optional
@@ -6,13 +7,20 @@ from typing import Any, Optional
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ios_location_injector import (
+    AUTO_STOP_DISTANCE_METERS,
+    GPS_JUMP_GUARD_SPEED_MPS,
     IOSLocationController,
-    add_location_drift,
+    LOCATION_SETTLE_SECONDS,
+    build_running_sway_route,
+    build_loop_route,
+    distance_m,
     gcj02_to_wgs84,
-    interpolate_route,
+    keep_point_outside_restricted_areas,
+    limit_route_step_distance,
+    validate_running_plan,
 )
 
 
@@ -52,6 +60,7 @@ HTML = r"""<!doctype html>
       display: flex;
       flex-direction: column;
       min-width: 0;
+      position: relative;
     }
     .status {
       min-height: 28px;
@@ -107,6 +116,33 @@ HTML = r"""<!doctype html>
     button.secondary { background: #475569; }
     button.warn { background: var(--red); }
     button:disabled { opacity: .58; cursor: default; }
+    .map-tools {
+      position: absolute;
+      right: 30px;
+      top: 54px;
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid rgba(15, 23, 42, .16);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .9);
+      box-shadow: 0 8px 22px rgba(15, 23, 42, .12);
+      z-index: 2;
+    }
+    .map-tools button {
+      width: auto;
+      height: 30px;
+      margin: 0;
+      padding: 0 10px;
+      border-radius: 5px;
+      color: #334155;
+      background: transparent;
+      font-size: 13px;
+    }
+    .map-tools button.active {
+      color: white;
+      background: var(--blue);
+    }
     .device {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -122,6 +158,45 @@ HTML = r"""<!doctype html>
       padding-bottom: 14px;
       margin-bottom: 14px;
       border-bottom: 1px solid #e5e7eb;
+    }
+    .track-options {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .track-card {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid #d8dee8;
+      border-radius: 8px;
+      background: #fbfdff;
+      cursor: pointer;
+    }
+    .track-card.selected {
+      border-color: var(--blue);
+      background: #eef5ff;
+      box-shadow: inset 0 0 0 1px rgba(37, 99, 235, .2);
+    }
+    .track-card input {
+      width: 16px;
+      height: 16px;
+      margin: 2px 0 0;
+      padding: 0;
+    }
+    .track-name {
+      font-size: 14px;
+      font-weight: 650;
+      color: #1f2937;
+      line-height: 1.25;
+    }
+    .track-meta {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
     }
     .toast {
       position: fixed;
@@ -147,6 +222,10 @@ HTML = r"""<!doctype html>
   <main class="app">
     <section class="map-pane">
       <div id="routeStatus" class="status">在地图上点击添加跑步路线点</div>
+      <div class="map-tools" aria-label="地图图层">
+        <button id="satelliteLayer" class="active" type="button">卫星</button>
+        <button id="standardLayer" type="button">标准</button>
+      </div>
       <canvas id="map" width="900" height="620"></canvas>
     </section>
     <aside class="controls">
@@ -166,12 +245,18 @@ HTML = r"""<!doctype html>
         <button id="clear" class="warn">清除虚拟定位</button>
       </div>
       <div class="group">
+        <label>预设轨道</label>
+        <div id="trackOptions" class="track-options"></div>
+      </div>
+      <div class="group">
         <label>跑步速度 km/h</label>
-        <input id="speed" value="8.0" inputmode="decimal" />
+        <input id="speed" value="10.0" inputmode="decimal" />
         <label>注入间隔 秒</label>
         <input id="interval" value="2.0" inputmode="decimal" />
-        <label>随机浮动 米</label>
-        <input id="drift" value="6.0" inputmode="decimal" />
+        <label>步态摆动 米</label>
+        <input id="drift" value="0.5" inputmode="decimal" />
+        <label>模拟圈数</label>
+        <input id="laps" value="6" inputmode="numeric" />
         <button id="startRun">开始轨迹跑步</button>
         <button id="stopRun" class="warn">停止跑步</button>
       </div>
@@ -191,23 +276,272 @@ HTML = r"""<!doctype html>
       lon: document.getElementById('lon'),
       speed: document.getElementById('speed'),
       interval: document.getElementById('interval'),
-      drift: document.getElementById('drift')
+      drift: document.getElementById('drift'),
+      laps: document.getElementById('laps')
+    };
+    const PRESET_TRACKS = [
+      {
+        id: 'hdu_ufo',
+        name: '体育馆',
+        distanceMeters: 768,
+        closedLoop: true,
+        startPoint: {lat: 30.314193250868055, lng: 120.34040256076389},
+        markingArea: {
+          type: 'bbox',
+          southWest: {lat: 30.31211236, lng: 120.33941541883681},
+          northEast: {lat: 30.31422852, lng: 120.3411556}
+        },
+        restrictedAreas: []
+      },
+      {
+        id: 'hdu_east',
+        name: '东操场',
+        distanceMeters: 386,
+        closedLoop: true,
+        startPoint: {lat: 30.31430939019097, lng: 120.34784695095487},
+        markingArea: {
+          type: 'bbox',
+          southWest: {lat: 30.314309390190974, lng: 120.3470779079861},
+          northEast: {lat: 30.315380859375, lng: 120.34784695095485}
+        },
+        restrictedAreas: [
+          {
+            type: 'polygon',
+            points: [
+              {lat: 30.31435031467014, lng: 120.34711588541667},
+              {lat: 30.31435031467014, lng: 120.34780788845482},
+              {lat: 30.315342881944446, lng: 120.34780788845482},
+              {lat: 30.315342881944446, lng: 120.34711588541667}
+            ]
+          }
+        ]
+      },
+      {
+        id: 'hdu_living',
+        name: '生活区',
+        distanceMeters: 434,
+        closedLoop: true,
+        startPoint: {lat: 30.316688910590276, lng: 120.34056830512153},
+        markingArea: {
+          type: 'bbox',
+          southWest: {lat: 30.31631591796875, lng: 120.33967393663194},
+          northEast: {lat: 30.317822265625, lng: 120.34056830512152}
+        },
+        restrictedAreas: []
+      }
+    ];
+    const GENERATION_RULES = {
+      coordinateSystem: 'gcj02',
+      mustStayInsideMarkingArea: true,
+      mustAvoidRestrictedAreas: true,
+      closedLoopRequired: true,
+      routeInsetMeters: 2,
+      defaultTrackId: 'hdu_east'
     };
     const state = {
-      centerLat: 39.908823,
-      centerLon: 116.397470,
+      centerLat: 30.31430939019097,
+      centerLon: 120.34784695095487,
       route: [],
+      selectedRoutePointIndex: null,
+      selectedTrackId: GENERATION_RULES.defaultTrackId,
       current: null,
-      zoom: 17,
+      real: null,
+      zoom: 19,
       minZoom: 3,
       maxZoom: 19,
       tileSize: 256,
+      layer: 'satellite',
       running: false
     };
     const tileCache = new Map();
+    const transformPI = Math.PI;
+    const transformA = 6378245.0;
+    const transformEE = 0.00669342162296594323;
 
     function metersPerLonDegree(lat) {
       return 111320.0 * Math.cos(lat * Math.PI / 180);
+    }
+    function outOfChina(lat, lon) {
+      return lon < 72.004 || lon > 137.8347 || lat < 0.8293 || lat > 55.8271;
+    }
+    function transformLat(x, y) {
+      let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y;
+      ret += 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+      ret += (20.0 * Math.sin(6.0 * x * transformPI) + 20.0 * Math.sin(2.0 * x * transformPI)) * 2.0 / 3.0;
+      ret += (20.0 * Math.sin(y * transformPI) + 40.0 * Math.sin(y / 3.0 * transformPI)) * 2.0 / 3.0;
+      ret += (160.0 * Math.sin(y / 12.0 * transformPI) + 320.0 * Math.sin(y * transformPI / 30.0)) * 2.0 / 3.0;
+      return ret;
+    }
+    function transformLon(x, y) {
+      let ret = 300.0 + x + 2.0 * y + 0.1 * x * x;
+      ret += 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+      ret += (20.0 * Math.sin(6.0 * x * transformPI) + 20.0 * Math.sin(2.0 * x * transformPI)) * 2.0 / 3.0;
+      ret += (20.0 * Math.sin(x * transformPI) + 40.0 * Math.sin(x / 3.0 * transformPI)) * 2.0 / 3.0;
+      ret += (150.0 * Math.sin(x / 12.0 * transformPI) + 300.0 * Math.sin(x / 30.0 * transformPI)) * 2.0 / 3.0;
+      return ret;
+    }
+    function wgs84ToGcj02(lat, lon) {
+      if (outOfChina(lat, lon)) return {lat, lon};
+
+      let dLat = transformLat(lon - 105.0, lat - 35.0);
+      let dLon = transformLon(lon - 105.0, lat - 35.0);
+      const radLat = lat / 180.0 * transformPI;
+      let magic = Math.sin(radLat);
+      magic = 1 - transformEE * magic * magic;
+      const sqrtMagic = Math.sqrt(magic);
+      dLat = (dLat * 180.0) / ((transformA * (1 - transformEE)) / (magic * sqrtMagic) * transformPI);
+      dLon = (dLon * 180.0) / (transformA / sqrtMagic * Math.cos(radLat) * transformPI);
+      return {lat: lat + dLat, lon: lon + dLon};
+    }
+    function gcj02ToWgs84(lat, lon) {
+      if (outOfChina(lat, lon)) return {lat, lon};
+      const gcj = wgs84ToGcj02(lat, lon);
+      return {lat: lat * 2 - gcj.lat, lon: lon * 2 - gcj.lon};
+    }
+    function normalizePoint(point) {
+      return {lat: point.lat, lon: point.lon ?? point.lng};
+    }
+    function selectedTrack() {
+      return PRESET_TRACKS.find(track => track.id === state.selectedTrackId) || PRESET_TRACKS[0];
+    }
+    function bboxCorners(markingArea) {
+      const sw = normalizePoint(markingArea.southWest);
+      const ne = normalizePoint(markingArea.northEast);
+      return [
+        {lat: sw.lat, lon: sw.lon},
+        {lat: sw.lat, lon: ne.lon},
+        {lat: ne.lat, lon: ne.lon},
+        {lat: ne.lat, lon: sw.lon}
+      ];
+    }
+    function routeBboxCorners(track) {
+      const sw = normalizePoint(track.markingArea.southWest);
+      const ne = normalizePoint(track.markingArea.northEast);
+      const start = normalizePoint(track.startPoint);
+      const meanLat = (sw.lat + ne.lat) / 2;
+      const lonScale = metersPerLonDegree(meanLat);
+      const inset = GENERATION_RULES.routeInsetMeters;
+      const innerSw = {
+        lat: sw.lat + inset / 111320.0,
+        lon: sw.lon + inset / lonScale
+      };
+      const innerNe = {
+        lat: ne.lat - inset / 111320.0,
+        lon: ne.lon - inset / lonScale
+      };
+      const fullWidth = Math.abs(innerNe.lon - innerSw.lon) * lonScale;
+      const fullHeight = Math.abs(innerNe.lat - innerSw.lat) * 111320.0;
+      const targetHalfPerimeter = track.distanceMeters / 2;
+
+      if (track.distanceMeters > 0 && targetHalfPerimeter > fullWidth && targetHalfPerimeter <= fullWidth + fullHeight) {
+        const targetHeight = targetHalfPerimeter - fullWidth;
+        const targetLatSpan = targetHeight / 111320.0;
+        let south = start.lat - targetLatSpan / 2;
+        south = Math.max(innerSw.lat, Math.min(south, innerNe.lat - targetLatSpan));
+        const north = south + targetLatSpan;
+        return [
+          {lat: south, lon: innerSw.lon},
+          {lat: south, lon: innerNe.lon},
+          {lat: north, lon: innerNe.lon},
+          {lat: north, lon: innerSw.lon}
+        ];
+      }
+
+      if (track.distanceMeters > 0 && targetHalfPerimeter > fullHeight && targetHalfPerimeter <= fullWidth + fullHeight) {
+        const targetWidth = targetHalfPerimeter - fullHeight;
+        const targetLonSpan = targetWidth / lonScale;
+        let west = start.lon - targetLonSpan / 2;
+        west = Math.max(innerSw.lon, Math.min(west, innerNe.lon - targetLonSpan));
+        const east = west + targetLonSpan;
+        return [
+          {lat: innerSw.lat, lon: west},
+          {lat: innerSw.lat, lon: east},
+          {lat: innerNe.lat, lon: east},
+          {lat: innerNe.lat, lon: west}
+        ];
+      }
+
+      return [
+        {lat: innerSw.lat, lon: innerSw.lon},
+        {lat: innerSw.lat, lon: innerNe.lon},
+        {lat: innerNe.lat, lon: innerNe.lon},
+        {lat: innerNe.lat, lon: innerSw.lon}
+      ];
+    }
+    function closestEdgeStart(start, corners) {
+      let best = {index: 0, point: start, distance: Infinity};
+      corners.forEach((a, index) => {
+        const b = corners[(index + 1) % corners.length];
+        const meanLat = (a.lat + b.lat + start.lat) / 3;
+        const scaleX = metersPerLonDegree(meanLat);
+        const ax = a.lon * scaleX;
+        const ay = a.lat * 111320.0;
+        const bx = b.lon * scaleX;
+        const by = b.lat * 111320.0;
+        const sx = start.lon * scaleX;
+        const sy = start.lat * 111320.0;
+        const dx = bx - ax;
+        const dy = by - ay;
+        const t = Math.max(0, Math.min(1, ((sx - ax) * dx + (sy - ay) * dy) / (dx * dx + dy * dy || 1)));
+        const projected = {
+          lat: (ay + dy * t) / 111320.0,
+          lon: (ax + dx * t) / scaleX
+        };
+        const edgeDistance = distance(start, projected);
+        if (edgeDistance < best.distance) best = {index, point: edgeDistance <= 8 ? start : projected, distance: edgeDistance};
+      });
+      return best;
+    }
+    function buildTrackRoute(track) {
+      const corners = routeBboxCorners(track);
+      const start = normalizePoint(track.startPoint);
+      const edge = closestEdgeStart(start, corners);
+      const route = [edge.point];
+
+      for (let offset = 1; offset <= corners.length; offset++) {
+        const corner = corners[(edge.index + offset) % corners.length];
+        if (distance(route[route.length - 1], corner) > 0.5) route.push(corner);
+      }
+
+      return route;
+    }
+    function markingAreaPolygon(track) {
+      if (track.markingArea.type === 'bbox') return bboxCorners(track.markingArea);
+      return (track.markingArea.points || []).map(normalizePoint);
+    }
+    function renderTrackOptions() {
+      const container = document.getElementById('trackOptions');
+      container.innerHTML = '';
+      PRESET_TRACKS.forEach(track => {
+        const label = document.createElement('label');
+        label.className = `track-card${track.id === state.selectedTrackId ? ' selected' : ''}`;
+        label.innerHTML = `
+          <input type="radio" name="presetTrack" value="${track.id}" ${track.id === state.selectedTrackId ? 'checked' : ''} />
+          <span>
+            <span class="track-name">${track.name}</span>
+            <span class="track-meta">${track.distanceMeters} 米 · 闭环</span>
+          </span>
+        `;
+        label.querySelector('input').addEventListener('change', () => selectTrack(track.id));
+        container.appendChild(label);
+      });
+    }
+    function selectTrack(trackId) {
+      state.selectedTrackId = trackId;
+      const track = selectedTrack();
+      const start = normalizePoint(track.startPoint);
+      state.route = buildTrackRoute(track);
+      state.selectedRoutePointIndex = 0;
+      state.centerLat = start.lat;
+      state.centerLon = start.lon;
+      state.current = start;
+      fields.lat.value = start.lat.toFixed(6);
+      fields.lon.value = start.lon.toFixed(6);
+      renderTrackOptions();
+      draw();
+    }
+    function mapPointForLayer(lat, lon) {
+      return state.layer === 'satellite' ? gcj02ToWgs84(lat, lon) : {lat, lon};
     }
     function distance(a, b) {
       const meanLat = (a.lat + b.lat) / 2;
@@ -234,26 +568,38 @@ HTML = r"""<!doctype html>
       return {lat, lon};
     }
     function latlonToXY(lat, lon) {
-      const center = latlonToWorld(state.centerLat, state.centerLon);
-      const point = latlonToWorld(lat, lon);
+      const displayCenter = mapPointForLayer(state.centerLat, state.centerLon);
+      const displayPoint = mapPointForLayer(lat, lon);
+      const center = latlonToWorld(displayCenter.lat, displayCenter.lon);
+      const point = latlonToWorld(displayPoint.lat, displayPoint.lon);
       return {
         x: canvas.width / 2 + point.x - center.x,
         y: canvas.height / 2 + point.y - center.y
       };
     }
     function xyToLatlon(x, y) {
-      const center = latlonToWorld(state.centerLat, state.centerLon);
-      return worldToLatlon(center.x + x - canvas.width / 2, center.y + y - canvas.height / 2);
+      const displayCenter = mapPointForLayer(state.centerLat, state.centerLon);
+      const center = latlonToWorld(displayCenter.lat, displayCenter.lon);
+      const point = worldToLatlon(center.x + x - canvas.width / 2, center.y + y - canvas.height / 2);
+      return state.layer === 'satellite' ? wgs84ToGcj02(point.lat, point.lon) : point;
     }
-    function tileUrl(x, y, z) {
-      const subdomain = Math.abs(x + y) % 4 + 1;
-      return `https://webrd0${subdomain}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x=${x}&y=${y}&z=${z}`;
-    }
-    function drawMapTiles() {
-      ctx.fillStyle = '#dce6ef';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    function tileUrl(x, y, z, style) {
+      if (style === 'imagery') {
+        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      }
 
-      const center = latlonToWorld(state.centerLat, state.centerLon);
+      const subdomain = Math.abs(x + y) % 4 + 1;
+      return `https://webrd0${subdomain}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=${style}&x=${x}&y=${y}&z=${z}`;
+    }
+    function maxZoomForLayer() {
+      return state.layer === 'standard' ? 18 : state.maxZoom;
+    }
+    function drawTileLayer(style, fillMissing) {
+      const displayCenter = style === 'imagery' ? gcj02ToWgs84(state.centerLat, state.centerLon) : {
+        lat: state.centerLat,
+        lon: state.centerLon
+      };
+      const center = latlonToWorld(displayCenter.lat, displayCenter.lon);
       const topLeft = {
         x: center.x - canvas.width / 2,
         y: center.y - canvas.height / 2
@@ -269,7 +615,7 @@ HTML = r"""<!doctype html>
         for (let ty = startY; ty <= endY; ty++) {
           if (ty < 0 || ty >= maxTile) continue;
           const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
-          const key = `${state.zoom}/${wrappedX}/${ty}`;
+          const key = `${style}/${state.zoom}/${wrappedX}/${ty}`;
           const dx = Math.round(tx * state.tileSize - topLeft.x);
           const dy = Math.round(ty * state.tileSize - topLeft.y);
           let tile = tileCache.get(key);
@@ -277,18 +623,31 @@ HTML = r"""<!doctype html>
             tile = new Image();
             tile.onload = () => draw();
             tile.onerror = () => draw();
-            tile.src = tileUrl(wrappedX, ty, state.zoom);
+            tile.src = tileUrl(wrappedX, ty, state.zoom, style);
             tileCache.set(key, tile);
           }
           if (tile.complete && tile.naturalWidth > 0) {
             ctx.drawImage(tile, dx, dy, state.tileSize, state.tileSize);
           } else {
             loading = true;
-            ctx.fillStyle = '#edf2f7';
-            ctx.fillRect(dx, dy, state.tileSize, state.tileSize);
+            if (fillMissing) {
+              ctx.fillStyle = '#edf2f7';
+              ctx.fillRect(dx, dy, state.tileSize, state.tileSize);
+            }
           }
         }
       }
+      return loading;
+    }
+    function drawMapTiles() {
+      ctx.fillStyle = '#dce6ef';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const styles = state.layer === 'satellite' ? ['imagery'] : [7];
+      let loading = false;
+      styles.forEach((style, index) => {
+        loading = drawTileLayer(style, index === 0) || loading;
+      });
 
       if (loading) {
         ctx.fillStyle = 'rgba(17, 24, 39, .74)';
@@ -307,9 +666,30 @@ HTML = r"""<!doctype html>
         routeStatus.textContent = '在地图上点击添加跑步路线点';
         return;
       }
+      const closeIndex = closePointIndex();
+      const lap = state.route.slice(closeIndex).concat(state.route.slice(0, closeIndex + 1));
       let total = 0;
-      for (let i = 1; i < state.route.length; i++) total += distance(state.route[i - 1], state.route[i]);
-      routeStatus.textContent = `路线点：${state.route.length} 个  距离约：${total.toFixed(0)} 米`;
+      for (let i = 1; i < lap.length; i++) total += distance(lap[i - 1], lap[i]);
+      const track = selectedTrack();
+      routeStatus.textContent = `已选择：${track.name}  目标：${track.distanceMeters} 米  单圈约：${total.toFixed(0)} 米`;
+    }
+    function closePointIndex() {
+      if (state.route.length < 2) return 0;
+      if (state.selectedRoutePointIndex === null) return 0;
+      return Math.max(0, Math.min(state.selectedRoutePointIndex, state.route.length - 1));
+    }
+    function hitRoutePoint(x, y) {
+      let nearestIndex = null;
+      let nearestDistance = 14;
+      state.route.forEach((p, index) => {
+        const pt = latlonToXY(p.lat, p.lon);
+        const pointDistance = Math.hypot(pt.x - x, pt.y - y);
+        if (pointDistance <= nearestDistance) {
+          nearestIndex = index;
+          nearestDistance = pointDistance;
+        }
+      });
+      return nearestIndex;
     }
     function draw() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -324,7 +704,7 @@ HTML = r"""<!doctype html>
       ctx.stroke();
       ctx.fillStyle = '#2d3748';
       ctx.font = '14px -apple-system, BlinkMacSystemFont, sans-serif';
-      ctx.fillText('点击添加路线点，拖拽移动地图，滚轮缩放', 12, canvas.height - 48);
+      ctx.fillText('点击添加路线点，点击已有点设为闭合点，拖拽移动地图，滚轮缩放', 12, canvas.height - 48);
       const scaleX = canvas.width - 140;
       const scaleY = canvas.height - 28;
       ctx.strokeStyle = '#2d3748';
@@ -332,6 +712,8 @@ HTML = r"""<!doctype html>
       ctx.beginPath(); ctx.moveTo(scaleX, scaleY); ctx.lineTo(scaleX + 100, scaleY); ctx.stroke();
       const metersPerPixel = Math.cos(state.centerLat * Math.PI / 180) * 156543.03392 / Math.pow(2, state.zoom);
       ctx.fillText(`${Math.round(metersPerPixel * 100)} 米`, scaleX + 28, scaleY - 10);
+
+      drawPresetAreas();
 
       if (state.route.length >= 2) {
         ctx.strokeStyle = '#e05a47';
@@ -342,30 +724,93 @@ HTML = r"""<!doctype html>
           if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
         });
         ctx.stroke();
+
+        const first = latlonToXY(state.route[0].lat, state.route[0].lon);
+        const last = latlonToXY(state.route[state.route.length - 1].lat, state.route[state.route.length - 1].lon);
+        ctx.save();
+        ctx.strokeStyle = '#16a34a';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([7, 5]);
+        ctx.beginPath();
+        ctx.moveTo(last.x, last.y);
+        ctx.lineTo(first.x, first.y);
+        ctx.stroke();
+        ctx.restore();
       }
       state.route.forEach((p, index) => {
         const pt = latlonToXY(p.lat, p.lon);
+        const selected = state.selectedRoutePointIndex === index;
+        const radius = selected ? 12 : 7;
         ctx.fillStyle = index === 0 ? '#2b6cb0' : '#dd6b20';
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.strokeStyle = selected ? '#22c55e' : 'white';
+        ctx.lineWidth = selected ? 3 : 2;
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         ctx.fillStyle = '#1a202c';
         ctx.font = 'bold 13px Arial';
         ctx.textAlign = 'center';
-        ctx.fillText(String(index + 1), pt.x, pt.y - 15);
+        ctx.fillText(String(index + 1), pt.x, pt.y - radius - 8);
         ctx.textAlign = 'left';
       });
+      if (state.real) {
+        const pt = latlonToXY(state.real.lat, state.real.lon);
+        ctx.save();
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 10, 0, Math.PI * 2); ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = '#1d4ed8';
+        ctx.font = '14px Arial';
+        ctx.fillText('真实位置', pt.x + 14, pt.y + 4);
+      }
       if (state.current) {
         const pt = latlonToXY(state.current.lat, state.current.lon);
         ctx.fillStyle = '#15a46b';
         ctx.strokeStyle = 'white';
         ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         ctx.fillStyle = '#0f5132';
         ctx.font = '14px Arial';
-        ctx.fillText('当前位置', pt.x + 12, pt.y + 4);
+        ctx.fillText('虚拟定位', pt.x + 14, pt.y + 4);
       }
       updateRouteStatus();
+    }
+    function drawPolygon(points, fill, stroke, width = 2, dashed = false) {
+      if (points.length < 2) return;
+      ctx.save();
+      ctx.beginPath();
+      points.forEach((p, index) => {
+        const pt = latlonToXY(p.lat, p.lon);
+        if (index === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.closePath();
+      if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fill();
+      }
+      if (stroke) {
+        if (dashed) ctx.setLineDash([8, 5]);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = width;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    function drawPresetAreas() {
+      PRESET_TRACKS.forEach(track => {
+        const isSelected = track.id === state.selectedTrackId;
+        drawPolygon(
+          markingAreaPolygon(track),
+          isSelected ? 'rgba(37, 99, 235, .14)' : 'rgba(15, 23, 42, .05)',
+          isSelected ? '#2563eb' : 'rgba(71, 85, 105, .55)',
+          isSelected ? 3 : 1.5,
+          !isSelected
+        );
+        (track.restrictedAreas || []).forEach(area => {
+          if (area.type !== 'polygon') return;
+          drawPolygon(area.points.map(normalizePoint), 'rgba(220, 38, 38, .18)', '#dc2626', 2, true);
+        });
+      });
     }
     function toast(text) {
       const el = document.getElementById('toast');
@@ -395,7 +840,8 @@ HTML = r"""<!doctype html>
       drag.moved = false;
       drag.x = event.clientX;
       drag.y = event.clientY;
-      drag.center = latlonToWorld(state.centerLat, state.centerLon);
+      const displayCenter = mapPointForLayer(state.centerLat, state.centerLon);
+      drag.center = latlonToWorld(displayCenter.lat, displayCenter.lon);
       canvas.style.cursor = 'grabbing';
     });
     window.addEventListener('mousemove', event => {
@@ -404,21 +850,30 @@ HTML = r"""<!doctype html>
       const dy = event.clientY - drag.y;
       if (Math.hypot(dx, dy) > 3) drag.moved = true;
       const next = worldToLatlon(drag.center.x - dx, drag.center.y - dy);
-      state.centerLat = next.lat;
-      state.centerLon = next.lon;
+      const center = state.layer === 'satellite' ? wgs84ToGcj02(next.lat, next.lon) : next;
+      state.centerLat = center.lat;
+      state.centerLon = center.lon;
       draw();
     });
     window.addEventListener('mouseup', () => {
       drag.active = false;
       canvas.style.cursor = 'crosshair';
     });
+    let wheelZoomDelta = 0;
+    let wheelZoomTimer = null;
     canvas.addEventListener('wheel', event => {
       event.preventDefault();
+      wheelZoomDelta += event.deltaY;
+      clearTimeout(wheelZoomTimer);
+      wheelZoomTimer = setTimeout(() => wheelZoomDelta = 0, 180);
+      if (Math.abs(wheelZoomDelta) < 120) return;
+
       const before = xyToLatlon(
         (event.clientX - canvas.getBoundingClientRect().left) * canvas.width / canvas.getBoundingClientRect().width,
         (event.clientY - canvas.getBoundingClientRect().top) * canvas.height / canvas.getBoundingClientRect().height
       );
-      state.zoom = Math.max(state.minZoom, Math.min(state.maxZoom, state.zoom + (event.deltaY < 0 ? 1 : -1)));
+      state.zoom = Math.max(state.minZoom, Math.min(maxZoomForLayer(), state.zoom + (wheelZoomDelta < 0 ? 1 : -1)));
+      wheelZoomDelta = 0;
       state.centerLat = before.lat;
       state.centerLon = before.lon;
       draw();
@@ -429,8 +884,19 @@ HTML = r"""<!doctype html>
       const rect = canvas.getBoundingClientRect();
       const x = (event.clientX - rect.left) * canvas.width / rect.width;
       const y = (event.clientY - rect.top) * canvas.height / rect.height;
+      const hitIndex = hitRoutePoint(x, y);
+      if (hitIndex !== null) {
+        const p = state.route[hitIndex];
+        state.selectedRoutePointIndex = hitIndex;
+        fields.lat.value = p.lat.toFixed(6);
+        fields.lon.value = p.lon.toFixed(6);
+        draw();
+        return;
+      }
+
       const p = xyToLatlon(x, y);
       state.route.push(p);
+      if (state.selectedRoutePointIndex === null) state.selectedRoutePointIndex = 0;
       state.current = p;
       fields.lat.value = p.lat.toFixed(6);
       fields.lon.value = p.lon.toFixed(6);
@@ -442,13 +908,28 @@ HTML = r"""<!doctype html>
       state.current = {lat: state.centerLat, lon: state.centerLon};
       draw();
     };
+    function setLayer(layer) {
+      state.layer = layer;
+      state.zoom = Math.min(state.zoom, maxZoomForLayer());
+      document.getElementById('satelliteLayer').classList.toggle('active', layer === 'satellite');
+      document.getElementById('standardLayer').classList.toggle('active', layer === 'standard');
+      draw();
+    }
+    document.getElementById('satelliteLayer').onclick = () => setLayer('satellite');
+    document.getElementById('standardLayer').onclick = () => setLayer('standard');
     document.getElementById('undo').onclick = () => {
       state.route.pop();
+      if (!state.route.length) {
+        state.selectedRoutePointIndex = null;
+      } else if (state.selectedRoutePointIndex !== null) {
+        state.selectedRoutePointIndex = Math.min(state.selectedRoutePointIndex, state.route.length - 1);
+      }
       state.current = state.route.length ? state.route[state.route.length - 1] : null;
       draw();
     };
     document.getElementById('clearRoute').onclick = () => {
       state.route = [];
+      state.selectedRoutePointIndex = null;
       state.current = null;
       draw();
     };
@@ -465,15 +946,22 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('clear').onclick = event => action(event.currentTarget, async () => {
       await post('/api/clear');
+      state.current = null;
+      draw();
       toast('虚拟定位已清除');
     });
     document.getElementById('startRun').onclick = event => action(event.currentTarget, async () => {
       if (state.route.length < 2) throw new Error('请先在地图上至少标两个路线点');
       await post('/api/route/start', {
         route: state.route,
+        restricted_areas: (selectedTrack().restrictedAreas || [])
+          .filter(area => area.type === 'polygon')
+          .map(area => area.points.map(normalizePoint)),
         speed: Number(fields.speed.value),
         interval: Number(fields.interval.value),
-        drift: Number(fields.drift.value)
+        drift: Number(fields.drift.value),
+        laps: Number(fields.laps.value),
+        close_point_index: closePointIndex()
       });
       state.running = true;
       updateRouteStatus('跑步模拟已开始');
@@ -497,7 +985,40 @@ HTML = r"""<!doctype html>
       } catch {}
       setTimeout(pollState, 1200);
     }
-    draw();
+    function locateRealPosition() {
+      if (!navigator.geolocation) {
+        toast('浏览器不支持获取真实位置');
+        return;
+      }
+
+      navigator.geolocation.getCurrentPosition(position => {
+        const point = wgs84ToGcj02(position.coords.latitude, position.coords.longitude);
+        state.real = point;
+        if (!state.selectedTrackId) {
+          state.centerLat = point.lat;
+          state.centerLon = point.lon;
+        }
+        draw();
+      }, error => {
+        toast(`无法获取真实位置：${error.message}`);
+      }, {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 30000
+      });
+
+      navigator.geolocation.watchPosition(position => {
+        state.real = wgs84ToGcj02(position.coords.latitude, position.coords.longitude);
+        draw();
+      }, () => {}, {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 30000
+      });
+    }
+    renderTrackOptions();
+    selectTrack(GENERATION_RULES.defaultTrackId);
+    locateRealPosition();
     pollState();
   </script>
 </body>
@@ -517,9 +1038,12 @@ class InjectRequest(BaseModel):
 
 class RouteStartRequest(BaseModel):
     route: list[Point]
+    restricted_areas: list[list[Point]] = Field(default_factory=list)
     speed: float
     interval: float
     drift: float
+    laps: int = 6
+    close_point_index: int = 0
 
 
 class WebState:
@@ -538,6 +1062,10 @@ class WebState:
     def set_current(self, lat: float, lon: float) -> None:
         with self.lock:
             self.current = {"lat": lat, "lon": lon}
+
+    def clear_current(self) -> None:
+        with self.lock:
+            self.current = None
 
     def set_route_status(self, text: str) -> None:
         with self.lock:
@@ -590,6 +1118,7 @@ def api_inject(req: InjectRequest) -> JSONResponse:
 def api_clear() -> JSONResponse:
     try:
         state.controller.clear_location()
+        state.clear_current()
         return ok()
     except Exception as exc:
         return fail(exc)
@@ -599,33 +1128,95 @@ def api_clear() -> JSONResponse:
 def api_route_start(req: RouteStartRequest) -> JSONResponse:
     if len(req.route) < 2:
         return JSONResponse({"ok": False, "error": "请先在地图上至少标两个路线点"}, status_code=400)
-    if req.speed <= 0 or req.interval <= 0 or req.drift < 0:
-        return JSONResponse({"ok": False, "error": "速度和间隔必须大于 0，随机浮动不能小于 0"}, status_code=400)
+    if req.speed <= 0 or req.interval <= 0 or req.drift < 0 or req.laps < 1:
+        return JSONResponse({"ok": False, "error": "速度和间隔必须大于 0，步态摆动不能小于 0，模拟圈数至少为 1"}, status_code=400)
     if state.thread and state.thread.is_alive():
         return JSONResponse({"ok": False, "error": "跑步模拟已经在进行中"}, status_code=400)
 
     points = [(point.lat, point.lon) for point in req.route]
-    route = interpolate_route(points, req.speed, req.interval)
+    restricted_areas = [[(point.lat, point.lon) for point in area] for area in req.restricted_areas]
+    close_point_index = max(0, min(req.close_point_index, len(points) - 1))
+    route, lap_end_indices = build_loop_route(points, req.speed, req.interval, req.laps, close_point_index)
+    route, lap_end_indices = limit_route_step_distance(route, lap_end_indices)
+    swayed_route = build_running_sway_route(route, req.drift)
+    if restricted_areas:
+        swayed_route = [
+            keep_point_outside_restricted_areas(point, restricted_areas)
+            for point in swayed_route
+        ]
+    swayed_route, lap_end_indices = limit_route_step_distance(swayed_route, lap_end_indices)
+    route = swayed_route
+    plan_ok, plan_messages = validate_running_plan(swayed_route, req.speed, req.interval, req.drift)
+    if not plan_ok:
+        return JSONResponse({"ok": False, "error": "\n".join(plan_messages)}, status_code=400)
+
+    lap_end_set = set(lap_end_indices)
     state.stop_event.clear()
-    state.set_route_status(f"跑步模拟中：共 {len(route)} 个注入点")
+    state.set_route_status(
+        f"跑步模拟中：闭合到第 {close_point_index + 1} 个点，共 {req.laps} 圈 / {len(route)} 个注入点；"
+        f"{plan_messages[-1]}；约 {AUTO_STOP_DISTANCE_METERS:.0f} 米自动停止"
+    )
 
     def runner() -> None:
         try:
-            for index, (lat, lon) in enumerate(route, start=1):
+            first_lat, first_lon = swayed_route[0]
+            first_wgs_lat, first_wgs_lon = gcj02_to_wgs84(first_lat, first_lon)
+            state.controller.set_location(first_wgs_lat, first_wgs_lon)
+            state.set_current(first_lat, first_lon)
+            state.set_route_status(f"首点稳定中：约 {LOCATION_SETTLE_SECONDS:.0f} 秒后开始移动")
+            if state.stop_event.wait(LOCATION_SETTLE_SECONDS):
+                return
+
+            next_tick = time.monotonic()
+            last_injected_point: Optional[tuple[float, float]] = None
+            last_injected_at: Optional[float] = None
+            injected_distance = 0.0
+            auto_stopped = False
+            for index, _point in enumerate(route, start=1):
                 if state.stop_event.is_set():
                     break
 
-                drift_lat, drift_lon = add_location_drift(lat, lon, req.drift)
+                now = time.monotonic()
+                if next_tick < now - req.interval:
+                    next_tick = now
+
+                wait_seconds = next_tick - time.monotonic()
+                if wait_seconds > 0 and state.stop_event.wait(wait_seconds):
+                    break
+
+                drift_lat, drift_lon = swayed_route[index - 1]
+                point_distance = 0.0
+                if last_injected_point is not None and last_injected_at is not None:
+                    point_distance = distance_m(last_injected_point, (drift_lat, drift_lon))
+                    min_elapsed = point_distance / GPS_JUMP_GUARD_SPEED_MPS
+                    guard_wait = min_elapsed - (time.monotonic() - last_injected_at)
+                    if guard_wait > 0 and state.stop_event.wait(guard_wait):
+                        break
+
                 wgs_lat, wgs_lon = gcj02_to_wgs84(drift_lat, drift_lon)
                 state.controller.set_location(wgs_lat, wgs_lon)
+                injected_distance += point_distance
+                last_injected_point = (drift_lat, drift_lon)
+                last_injected_at = time.monotonic()
                 state.set_current(drift_lat, drift_lon)
-                state.set_route_status(f"跑步模拟中：{index}/{len(route)}")
+                completed_laps = sum(1 for end_index in lap_end_indices if index >= end_index)
+                state.set_route_status(
+                    f"跑步模拟中：{index}/{len(route)}  已完成 {completed_laps}/{req.laps} 圈  {injected_distance:.0f} 米"
+                )
 
-                if state.stop_event.wait(req.interval):
+                if index in lap_end_set:
+                    state.set_route_status(f"已回到第 {close_point_index + 1} 个标定点：完成 {completed_laps}/{req.laps} 圈")
+
+                next_tick += req.interval
+                if injected_distance >= AUTO_STOP_DISTANCE_METERS:
+                    auto_stopped = True
+                    state.set_route_status(f"已达到 {injected_distance:.0f} 米，自动停止并保持最后位置")
                     break
 
             if state.stop_event.is_set():
                 state.set_route_status("跑步模拟已停止")
+            elif auto_stopped:
+                pass
             else:
                 state.set_route_status("跑步模拟完成")
         except Exception as exc:
