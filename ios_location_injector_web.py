@@ -14,6 +14,7 @@ from ios_location_injector import (
     GPS_JUMP_GUARD_SPEED_MPS,
     IOSLocationController,
     LOCATION_SETTLE_SECONDS,
+    bearing_degrees,
     build_running_sway_route,
     build_loop_route,
     distance_m,
@@ -765,15 +766,54 @@ HTML = r"""<!doctype html>
       }
       if (state.current) {
         const pt = latlonToXY(state.current.lat, state.current.lon);
-        ctx.fillStyle = '#15a46b';
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        drawRunnerMarker(pt.x, pt.y, state.current.heading ?? 0);
         ctx.fillStyle = '#0f5132';
         ctx.font = '14px Arial';
         ctx.fillText('虚拟定位', pt.x + 14, pt.y + 4);
       }
       updateRouteStatus();
+    }
+    function rotatedPoint(x, y, angle) {
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      return {x: x * cos - y * sin, y: x * sin + y * cos};
+    }
+    function markerPoint(centerX, centerY, x, y, angle) {
+      const point = rotatedPoint(x, y, angle);
+      return {x: centerX + point.x, y: centerY + point.y};
+    }
+    function drawRunnerMarker(x, y, headingDegrees) {
+      const angle = headingDegrees * Math.PI / 180;
+      const body = [[-6, 5], [0, -12], [6, 5], [0, 10]].map(([px, py]) => markerPoint(x, y, px, py, angle));
+      ctx.save();
+      ctx.fillStyle = '#15a46b';
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      body.forEach((point, index) => {
+        if (index === 0) ctx.moveTo(point.x, point.y); else ctx.lineTo(point.x, point.y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      const head = markerPoint(x, y, 0, -18, angle);
+      ctx.fillStyle = '#0f5132';
+      ctx.beginPath();
+      ctx.arc(head.x, head.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.strokeStyle = '#0f5132';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      [[[-2, -5], [-10, -1]], [[2, -5], [10, -10]], [[-2, 7], [-9, 15]], [[2, 7], [9, 13]]].forEach(([start, end]) => {
+        const a = markerPoint(x, y, start[0], start[1], angle);
+        const b = markerPoint(x, y, end[0], end[1], angle);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      });
+      ctx.restore();
     }
     function drawPolygon(points, fill, stroke, width = 2, dashed = false) {
       if (points.length < 2) return;
@@ -1059,9 +1099,14 @@ class WebState:
         with self.lock:
             return {"current": self.current, "route_status": self.route_status}
 
-    def set_current(self, lat: float, lon: float) -> None:
+    def set_current(self, lat: float, lon: float, heading: Optional[float] = None) -> None:
         with self.lock:
-            self.current = {"lat": lat, "lon": lon}
+            payload = {"lat": lat, "lon": lon}
+            if heading is not None:
+                payload["heading"] = heading
+            elif self.current and "heading" in self.current:
+                payload["heading"] = self.current["heading"]
+            self.current = payload
 
     def clear_current(self) -> None:
         with self.lock:
@@ -1162,7 +1207,8 @@ def api_route_start(req: RouteStartRequest) -> JSONResponse:
             first_lat, first_lon = swayed_route[0]
             first_wgs_lat, first_wgs_lon = gcj02_to_wgs84(first_lat, first_lon)
             state.controller.set_location(first_wgs_lat, first_wgs_lon)
-            state.set_current(first_lat, first_lon)
+            first_heading = bearing_degrees(swayed_route[0], swayed_route[1]) if len(swayed_route) > 1 else 0.0
+            state.set_current(first_lat, first_lon, first_heading)
             state.set_route_status(f"首点稳定中：约 {LOCATION_SETTLE_SECONDS:.0f} 秒后开始移动")
             if state.stop_event.wait(LOCATION_SETTLE_SECONDS):
                 return
@@ -1196,9 +1242,14 @@ def api_route_start(req: RouteStartRequest) -> JSONResponse:
                 wgs_lat, wgs_lon = gcj02_to_wgs84(drift_lat, drift_lon)
                 state.controller.set_location(wgs_lat, wgs_lon)
                 injected_distance += point_distance
+                heading = (
+                    bearing_degrees(last_injected_point, (drift_lat, drift_lon))
+                    if last_injected_point is not None and point_distance > 0.05
+                    else None
+                )
                 last_injected_point = (drift_lat, drift_lon)
                 last_injected_at = time.monotonic()
-                state.set_current(drift_lat, drift_lon)
+                state.set_current(drift_lat, drift_lon, heading)
                 completed_laps = sum(1 for end_index in lap_end_indices if index >= end_index)
                 state.set_route_status(
                     f"跑步模拟中：{index}/{len(route)}  已完成 {completed_laps}/{req.laps} 圈  {injected_distance:.0f} 米"

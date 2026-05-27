@@ -142,6 +142,17 @@ def distance_m(point_a: tuple[float, float], point_b: tuple[float, float]) -> fl
     return math.hypot(dx, dy)
 
 
+def bearing_degrees(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
+    lat_a, lon_a = point_a
+    lat_b, lon_b = point_b
+    mean_lat = (lat_a + lat_b) / 2
+    east_meters = (lon_b - lon_a) * meters_per_lon_degree(mean_lat)
+    north_meters = (lat_b - lat_a) * 111320.0
+    if abs(east_meters) < 1e-9 and abs(north_meters) < 1e-9:
+        return 0.0
+    return (math.degrees(math.atan2(east_meters, north_meters)) + 360.0) % 360.0
+
+
 def interpolate_route(
     points: list[tuple[float, float]], speed_kmh: float, interval_seconds: float
 ) -> list[tuple[float, float]]:
@@ -603,6 +614,7 @@ class IOSLocationApp:
         self.route_points: list[tuple[float, float]] = []
         self.selected_route_point_index: Optional[int] = None
         self.current_position: Optional[tuple[float, float]] = None
+        self.current_heading_degrees = 0.0
         self.real_position: Optional[tuple[float, float]] = None
         self.simulation_stop = threading.Event()
         self.simulation_thread: Optional[threading.Thread] = None
@@ -772,10 +784,30 @@ class IOSLocationApp:
 
         if self.current_position:
             x, y = self.latlon_to_xy(*self.current_position)
-            self.map_canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#15a46b", outline="white", width=2)
+            self._draw_runner_marker(x, y, self.current_heading_degrees)
             self.map_canvas.create_text(x + 13, y, text="虚拟定位", anchor="w", fill="#0f5132")
 
         self._update_route_status()
+
+    def _rotate_marker_point(self, x: float, y: float, angle_radians: float) -> tuple[float, float]:
+        cos_a = math.cos(angle_radians)
+        sin_a = math.sin(angle_radians)
+        return x * cos_a - y * sin_a, x * sin_a + y * cos_a
+
+    def _marker_point(self, center_x: float, center_y: float, x: float, y: float, angle_radians: float) -> tuple[float, float]:
+        rotated_x, rotated_y = self._rotate_marker_point(x, y, angle_radians)
+        return center_x + rotated_x, center_y + rotated_y
+
+    def _draw_runner_marker(self, x: float, y: float, heading_degrees: float) -> None:
+        angle = math.radians(heading_degrees)
+        body = [self._marker_point(x, y, px, py, angle) for px, py in [(-6, 5), (0, -12), (6, 5), (0, 10)]]
+        self.map_canvas.create_polygon(*body, fill="#15a46b", outline="white", width=2)
+        head_x, head_y = self._marker_point(x, y, 0, -18, angle)
+        self.map_canvas.create_oval(head_x - 4, head_y - 4, head_x + 4, head_y + 4, fill="#0f5132", outline="white", width=1)
+        for start, end in [((-2, -5), (-10, -1)), ((2, -5), (10, -10)), ((-2, 7), (-9, 15)), ((2, 7), (9, 13))]:
+            x1, y1 = self._marker_point(x, y, *start, angle)
+            x2, y2 = self._marker_point(x, y, *end, angle)
+            self.map_canvas.create_line(x1, y1, x2, y2, fill="#0f5132", width=3, capstyle=tk.ROUND)
 
     def _draw_map_background(self) -> None:
         if self._draw_amap_tiles():
@@ -983,12 +1015,16 @@ class IOSLocationApp:
 
         self._run_background(task, "虚拟定位已清除")
 
-    def _set_current_position(self, lat: Optional[float], lon: Optional[float] = None) -> None:
+    def _set_current_position(
+        self, lat: Optional[float], lon: Optional[float] = None, heading_degrees: Optional[float] = None
+    ) -> None:
         if lat is None or lon is None:
             self.current_position = None
             self._redraw_map()
             return
         self.current_position = (lat, lon)
+        if heading_degrees is not None:
+            self.current_heading_degrees = heading_degrees
         self.lat_var.set(f"{lat:.6f}")
         self.lon_var.set(f"{lon:.6f}")
         self._redraw_map()
@@ -1040,7 +1076,13 @@ class IOSLocationApp:
                 first_lat, first_lon = swayed_route[0]
                 first_wgs_lat, first_wgs_lon = gcj02_to_wgs84(first_lat, first_lon)
                 self.controller.set_location(first_wgs_lat, first_wgs_lon)
-                self.root.after(0, lambda lat=first_lat, lon=first_lon: self._set_current_position(lat, lon))
+                first_heading = bearing_degrees(swayed_route[0], swayed_route[1]) if len(swayed_route) > 1 else 0.0
+                self.root.after(
+                    0,
+                    lambda lat=first_lat, lon=first_lon, heading=first_heading: self._set_current_position(
+                        lat, lon, heading
+                    ),
+                )
                 if self.simulation_stop.wait(LOCATION_SETTLE_SECONDS):
                     return
 
@@ -1073,9 +1115,19 @@ class IOSLocationApp:
                     wgs_lat, wgs_lon = gcj02_to_wgs84(drift_lat, drift_lon)
                     self.controller.set_location(wgs_lat, wgs_lon)
                     injected_distance += point_distance
+                    heading = (
+                        bearing_degrees(last_injected_point, (drift_lat, drift_lon))
+                        if last_injected_point is not None and point_distance > 0.05
+                        else self.current_heading_degrees
+                    )
                     last_injected_point = (drift_lat, drift_lon)
                     last_injected_at = time.monotonic()
-                    self.root.after(0, lambda lat=drift_lat, lon=drift_lon: self._set_current_position(lat, lon))
+                    self.root.after(
+                        0,
+                        lambda lat=drift_lat, lon=drift_lon, heading=heading: self._set_current_position(
+                            lat, lon, heading
+                        ),
+                    )
                     completed_laps = sum(1 for end_index in lap_end_indices if index >= end_index)
                     self.root.after(
                         0,
